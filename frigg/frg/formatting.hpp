@@ -1,0 +1,671 @@
+#ifndef FRG_FORMATTING_HPP
+#define FRG_FORMATTING_HPP
+
+#include <stdarg.h>
+#include <cstddef>
+#include <stdint.h>
+#include <string.h>
+#include <frg/macros.hpp>
+#include <frg/optional.hpp>
+#include <frg/string.hpp>
+#include <frg/utility.hpp>
+#include <frg/tuple.hpp>
+
+namespace frg FRG_VISIBILITY {
+
+// Concept: Formatter.
+// Supports a single operation: append().
+// append() is overloaded for a variety of types.
+
+// TODO: Does it make sense for this library to implement Formatters at all?
+// TODO: Or should we only implement the formatting itself?
+
+template<typename C, size_t Limit>
+struct limited_formatter {
+	limited_formatter()
+	: _off{0} { }
+
+	void append(C s) {
+		_buffer[_off++] = s;
+	}
+
+	void append(C *str) {
+		while(*str)
+			_buffer[_off++] = *str++;
+	}
+
+private:
+	C _buffer[Limit];
+	size_t _off;
+};
+
+// ----------------------------------------------------------------------------
+// General formatting machinery.
+// ----------------------------------------------------------------------------
+
+enum class format_conversion {
+	null,
+	decimal,
+	hex
+};
+
+struct format_options {
+	format_options()
+	: conversion{format_conversion::null} { }
+
+	format_options with_conversion(format_conversion c) {
+		auto copy = *this;
+		copy.conversion = c;
+		return copy;
+	}
+
+	format_conversion conversion;
+	int minimum_width = 0;
+	int arg_pos = -1;
+	optional<int> precision;
+	bool left_justify = false;
+	bool always_sign = false;
+	bool plus_becomes_space = false;
+	bool alt_conversion = false;
+	bool fill_zeros = false;
+	bool group_thousands = false;
+	bool use_capitals = false;
+};
+
+struct locale_options {
+	locale_options()
+	: decimal_point("."), thousands_sep(""), grouping("\255") { }
+
+	locale_options(const char *d_p, const char *t_s, const char *grp)
+	: decimal_point(d_p), thousands_sep(t_s), grouping(grp) {
+		thousands_sep_size = strlen(thousands_sep);
+	}
+
+	const char *decimal_point;
+	const char *thousands_sep;
+	const char *grouping;
+	size_t thousands_sep_size;
+};
+
+enum class format_error {
+	success,
+	agent_error,
+};
+
+// ----------------------------------------------------------------------------
+// Formatting primitives for built-in types.
+// ----------------------------------------------------------------------------
+
+namespace _fmt_basics {
+	// width: Minimum width of the output (padded with spaces by default).
+	// precision: Minimum number of digits in the ouput (always padded with zeros).
+	template<typename P, typename T>
+	void print_digits(P &formatter, T number, bool negative, int radix,
+			int width, int precision, char padding, bool left_justify,
+			bool group_thousands, bool always_sign, bool plus_becomes_space,
+			bool use_capitals, locale_options locale_opts) {
+		const char *digits = use_capitals ? "0123456789ABCDEF" : "0123456789abcdef";
+		char buffer[32];
+
+		int k = 0; // number of digits
+		int c = 0; // number of chars since last grouping
+		int g = 0; // grouping index
+		int r = 0; // amount of times we repeated the last grouping
+		size_t extra = 0; // extra chars printed due to seperator
+
+		auto step_grouping = [&] () {
+			if (!group_thousands)
+				return;
+
+			if (++c == locale_opts.grouping[g]) {
+				if (locale_opts.grouping[g + 1] > 0)
+					g++;
+				else
+					r++;
+				c = 0;
+				extra += locale_opts.thousands_sep_size;
+			}
+		};
+
+		auto emit_grouping = [&] () {
+			if (!group_thousands)
+				return;
+
+			if (--c == 0) {
+				formatter.append(locale_opts.thousands_sep);
+				if (!r || !--r)
+					g--;
+				c = locale_opts.grouping[g];
+			}
+		};
+
+		// print the number in reverse order and determine #digits.
+		do {
+			FRG_ASSERT(k < 32); // TODO: variable number of digits
+			buffer[k++] = digits[number % radix];
+			number /= radix;
+			step_grouping();
+		} while(number);
+
+		if (k < precision)
+			for (int i = 0; i < precision - k; i++)
+				step_grouping();
+
+		if (!c)
+			c = locale_opts.grouping[g];
+
+		int final_width = max(k, precision) + extra;
+
+		if(!left_justify && final_width < width)
+			for(int i = 0; i < width - final_width; i++)
+				formatter.append(padding);
+
+		if(negative)
+			formatter.append('-');
+		else if(always_sign)
+			formatter.append('+');
+		else if(plus_becomes_space)
+			formatter.append(' ');
+
+		if(k < precision) {
+			for(int i = 0; i < precision - k; i++) {
+				formatter.append('0');
+				emit_grouping();
+			}
+		}
+
+		for(int i = k - 1; i >= 0; i--) {
+			formatter.append(buffer[i]);
+			emit_grouping();
+		}
+
+		if(left_justify && final_width < width)
+			for(int i = final_width; i < width; i++)
+				formatter.append(padding);
+	}
+
+	template<typename T>
+	struct make_unsigned;
+
+	template<> struct make_unsigned<signed char> { using type = unsigned char; };
+	template<> struct make_unsigned<unsigned char> { using type = unsigned char; };
+	template<> struct make_unsigned<short> { using type = unsigned short; };
+	template<> struct make_unsigned<unsigned short> { using type = unsigned short; };
+	template<> struct make_unsigned<int> { using type = unsigned int; };
+	template<> struct make_unsigned<unsigned int> { using type = unsigned int; };
+	template<> struct make_unsigned<long> { using type = unsigned long; };
+	template<> struct make_unsigned<unsigned long> { using type = unsigned long; };
+	template<> struct make_unsigned<long long> { using type = unsigned long long; };
+	template<> struct make_unsigned<unsigned long long> { using type = unsigned long long; };
+
+	// Signed integer formatting. We cannot print -x as that might not fit into the signed type.
+	// Strategy: Cast to unsigned first (i.e. obtain 2s complement) and negate manually by
+	// computing (~x + 1).
+	template<typename P, typename T>
+	void print_int(P &formatter, T number, int radix, int width = 0,
+			int precision = 1, char padding = ' ', bool left_justify = false,
+			bool group_thousands = false, bool always_sign = false,
+			bool plus_becomes_space = false, bool use_capitals = false,
+			locale_options locale_opts = {}) {
+		if(number < 0) {
+			auto absv = ~static_cast<typename make_unsigned<T>::type>(number) + 1;
+			print_digits(formatter, absv, true, radix, width, precision, padding,
+					left_justify, group_thousands, always_sign, plus_becomes_space, use_capitals,
+					locale_opts);
+		}else{
+			print_digits(formatter, number, false, radix, width, precision, padding,
+					left_justify, group_thousands, always_sign, plus_becomes_space, use_capitals,
+					locale_opts);
+		}
+	}
+
+	template<typename T, typename F>
+	void format_integer(T object, format_options fo, F &formatter) {
+		int radix = 10;
+		if(fo.conversion == format_conversion::hex) {
+			radix = 16;
+		}else{
+			FRG_ASSERT(fo.conversion == format_conversion::null
+					|| fo.conversion == format_conversion::decimal);
+		}
+
+		print_int(formatter, object, radix,
+				fo.minimum_width, fo.precision ? *fo.precision : 1,
+				fo.fill_zeros ? '0' : ' ', fo.left_justify, fo.group_thousands,
+				fo.always_sign, fo.plus_becomes_space, fo.use_capitals);
+	}
+
+	template<typename P, typename T>
+	void print_float(P &formatter, T number, int width = 0, int precision = 6,
+			char padding = ' ', bool left_justify = false, bool use_capitals = false,
+			bool group_thousands = false, locale_options locale_opts = {}) {
+		(void)group_thousands;
+
+		bool has_sign = false;
+		if (number < 0) {
+			formatter.append('-');
+			has_sign = true;
+		}
+
+		bool inf = __builtin_isinf(number), nan = __builtin_isnan(number);
+		if (inf || nan) {
+			auto total_length = 3 + has_sign;
+			auto pad_length = width > total_length ? width - total_length : 0;
+			if (!left_justify) {
+				while (pad_length > 0) {
+					formatter.append(' '); // for infs and nan's, always pad with spaces
+					pad_length--;
+				}
+			}
+
+			if (inf)
+				formatter.append(use_capitals ? "INF" : "inf");
+			else
+				formatter.append(use_capitals ? "NAN" : "nan");
+
+			if (left_justify) {
+				while (pad_length > 0) {
+					formatter.append(' '); // for infs and nan's, always pad with spaces
+					pad_length--;
+				}
+			}
+
+			return;
+		}
+
+		// At this point, we've already printed the sign, so pretend it's positive.
+		if (number < 0)
+			number = -number;
+
+		// TODO: The cast below is UB if number is out of range.
+		FRG_ASSERT(number < 0x1p40);
+		uint64_t n = static_cast<uint64_t>(number);
+
+		// Compute the number of decimal digits in the integer part of n
+		// TODO: Don't assume base 10
+		auto int_length = 0;
+		auto x = n;
+		do {
+			x /= 10;
+			int_length++;
+		} while (x != 0);
+
+		// Plus one for the decimal point
+		auto total_length = has_sign + int_length + (precision > 0 ? 1 + precision : 0);
+		auto pad_length = width > total_length ? width - total_length : 0;
+
+		if (!left_justify) {
+			while (pad_length > 0) {
+				formatter.append(padding);
+				pad_length--;
+			}
+		}
+
+		print_int(formatter, n, 10);
+		number -= n;
+
+		if (precision > 0)
+			formatter.append(locale_opts.decimal_point);
+
+		// TODO: This doesn't account for rounding properly.
+		// e.g 1.2 formatted with %.2f gives 1.19, but it should be 1.20
+		number *= 10;
+		n = static_cast<uint64_t>(number);
+		number -= n;
+		int i = 0;
+		while (n > 0 && i < precision) {
+			formatter.append('0' + n);
+			number *= 10;
+			n = static_cast<uint64_t>(number);
+			number -= n;
+			i++;
+		}
+
+		while (i < precision) {
+			formatter.append('0');
+			i++;
+		}
+
+		if (left_justify) {
+			while (pad_length > 0) {
+				formatter.append(padding);
+				pad_length--;
+			}
+		}
+	}
+
+	template<typename T, typename F>
+	void format_float(T object, format_options fo, F &formatter) {
+		int precision_or_default = fo.precision.has_value() ? *fo.precision : 6;
+		print_float(formatter, object, fo.minimum_width, precision_or_default,
+				fo.fill_zeros ? '0' : ' ');
+	}
+};
+
+template<typename F>
+void format_object(unsigned int object, format_options fo, F &formatter) {
+	_fmt_basics::format_integer(object, fo, formatter);
+}
+
+template<typename F>
+void format_object(unsigned long object, format_options fo, F &formatter) {
+	_fmt_basics::format_integer(object, fo, formatter);
+}
+
+template<typename F>
+void format_object(unsigned long long object, format_options fo, F &formatter) {
+	_fmt_basics::format_integer(object, fo, formatter);
+}
+
+template<typename F>
+void format_object(int object, format_options fo, F &formatter) {
+	_fmt_basics::format_integer(object, fo, formatter);
+}
+
+template<typename F>
+void format_object(long object, format_options fo, F &formatter) {
+	_fmt_basics::format_integer(object, fo, formatter);
+}
+
+template<typename F>
+void format_object(long long object, format_options fo, F &formatter) {
+	_fmt_basics::format_integer(object, fo, formatter);
+}
+
+template<typename F>
+void format_object(float object, format_options fo, F &formatter) {
+	_fmt_basics::format_integer(object, fo, formatter);
+}
+
+template<typename F>
+void format_object(double object, format_options fo, F &formatter) {
+	_fmt_basics::format_integer(object, fo, formatter);
+}
+
+template<typename F>
+void format_object(const char *object, format_options, F &formatter) {
+	formatter.append(object);
+}
+
+template<typename F>
+void format_object(const frg::string_view &object, format_options, F &formatter) {
+	for(size_t i = 0; i < object.size(); ++i)
+		formatter.append(object[i]);
+}
+
+template<typename F, typename Allocator>
+void format_object(const frg::string<Allocator> &object, format_options, F &formatter) {
+	formatter.append(object.data());
+}
+
+template<typename F>
+void format_object(const void *object, format_options fo, F &formatter) {
+	formatter.append("0x");
+	_fmt_basics::format_integer(reinterpret_cast<uintptr_t>(object),
+			fo.with_conversion(format_conversion::hex), formatter);
+}
+
+template<typename F>
+void format_object(std::nullptr_t, format_options fo, F &formatter) {
+	format_object(static_cast<const void *>(nullptr), fo, formatter);
+}
+
+// ----------------------------------------------------------------------------
+
+struct char_fmt {
+	template<typename F>
+	friend void format_object(char_fmt self, format_options fo, F &formatter) {
+		(void)fo;
+		formatter.append(self.c_);
+	}
+
+	template<typename T>
+	char_fmt(const T &x)
+	: c_{static_cast<char>(x)} { }
+
+private:
+	const char c_;
+};
+
+template<typename T>
+struct hex_fmt {
+	template<typename F>
+	friend void format_object(hex_fmt self, format_options fo, F &formatter) {
+		format(*self._xp, fo.with_conversion(format_conversion::hex), formatter);
+	}
+
+	hex_fmt(const T &x)
+	: _xp{&x} { }
+
+private:
+	const T *_xp;
+};
+
+static inline char *strchr(const char *s, int c) {
+	while (*s) {
+		if (*s == c)
+			return const_cast<char *>(s);
+
+		s++;
+	}
+
+	return nullptr;
+}
+
+struct escape_fmt {
+	template<typename F>
+	friend void format_object(escape_fmt self, format_options fo, F &formatter) {
+		auto p = reinterpret_cast<const unsigned char *>(self._buffer);
+		for(size_t i = 0; i < self._size; i++) {
+			auto c = p[i];
+			if((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')) {
+				formatter.append(c);
+			}else if(c >= '0' && c <= '9') {
+				formatter.append(c);
+			}else if(c == ' ') {
+				formatter.append(' ');
+			}else if(strchr("!#$%&()*+,-./:;<=>?@[]^_`{|}~", c)) {
+				formatter.append(c);
+			}else if(c == '\\') {
+				formatter.append("\\\\");
+			}else if(c == '\"') {
+				formatter.append("\\\"");
+			}else if(c == '\'') {
+				formatter.append("\\\'");
+			}else if(c == '\n') {
+				formatter.append("\\n");
+			}else if(c == '\t') {
+				formatter.append("\\t");
+			}else{
+				formatter.append("\\x{");
+				format((unsigned int)c, fo.with_conversion(format_conversion::hex), formatter);
+				formatter.append('}');
+			}
+		}
+	}
+
+	escape_fmt(const void *buffer, size_t size)
+	: _buffer{buffer}, _size{size} { }
+
+private:
+	const void *_buffer;
+	size_t _size;
+};
+
+static inline bool isdigit(char c) {
+	return c >= '0' && c <= '9';
+}
+
+namespace detail_ {
+	template <typename ...Ts>
+	struct fmt_impl {
+		frg::string_view fmt;
+		frg::tuple<Ts...> args;
+
+		template <typename F>
+		bool format_nth(size_t n, format_options fo, F &formatter) const {
+			if (n >= sizeof...(Ts))
+				return false;
+
+			return ![&]<size_t ...I>(std::index_sequence<I...>) -> bool {
+				return ((I == n
+					? (format(args.template get<I>(), fo, formatter), false)
+					: true) && ...);
+			}(std::make_index_sequence<sizeof...(Ts)>{});
+		}
+
+		// Format specifier syntax:
+		// ([0-9]+)?(:0?[0-9]*[dXx]?)?
+		bool parse_fmt_spec(frg::string_view spec, size_t &pos, format_options &fo) const {
+			enum class modes {
+				pos, fill, width, conv
+			} mode = modes::pos;
+			bool pos_set = false;
+			size_t tmp_pos = 0;
+
+			fo.minimum_width = 0;
+
+			for (size_t i = 0; i < spec.size(); i++) {
+				char c = spec[i];
+
+				switch (mode) {
+					case modes::pos:
+						if (isdigit(c)) {
+							pos_set = true;
+							tmp_pos *= 10;
+							tmp_pos += c - '0';
+						} else if (c == ':') {
+							mode = modes::fill;
+						} else {
+							return false;
+						}
+
+						break;
+
+					case modes::fill:
+						if (c == '0')
+							fo.fill_zeros = true;
+
+						mode = modes::width;
+
+						[[fallthrough]];
+
+					case modes::width:
+						if (isdigit(c)) {
+							fo.minimum_width *= 10;
+							fo.minimum_width += spec[i] - '0';
+						} else {
+							switch (spec[i]) {
+								case 'd': fo.conversion = format_conversion::decimal; break;
+								case 'X': fo.use_capitals = true; [[fallthrough]];
+								case 'x': fo.conversion = format_conversion::hex; break;
+								default: return false;
+							}
+
+							mode = modes::conv;
+						}
+
+						break;
+
+					// Anything after the conversion specifier is illegal.
+					case modes::conv:
+						return false;
+				}
+			}
+
+			if (pos_set)
+				pos = tmp_pos;
+
+			return true;
+		}
+
+		template <typename F>
+		friend void format_object(const fmt_impl &self, format_options fo, F &formatter) {
+			size_t current_arg = 0;
+			size_t arg_fmt_start = 0, arg_fmt_end = 0;
+
+			enum class modes {
+				str, arg
+			} mode = modes::str;
+
+			for (size_t i = 0; i < self.fmt.size(); i++) {
+				auto c = self.fmt[i];
+				auto next = (i + 1) < self.fmt.size() ? self.fmt[i + 1] : 0;
+
+				switch (mode) {
+					case modes::str: {
+						if (c == '{' && next != '{') {
+							mode = modes::arg;
+							arg_fmt_start = i;
+						} else {
+							if (c == '{')
+								i++;
+							formatter.append(c);
+						}
+
+						break;
+					}
+
+					case modes::arg:
+						if (c == '}') {
+							mode = modes::str;
+							arg_fmt_end = i;
+
+							format_options fo{};
+							size_t pos = current_arg++;
+
+							if (!self.parse_fmt_spec(self.fmt.sub_string(arg_fmt_start + 1,
+											arg_fmt_end - arg_fmt_start - 1), pos, fo)) {
+								// Failed to parse format specifier, print it as is
+								format_object(self.fmt.sub_string(arg_fmt_start,
+										arg_fmt_end - arg_fmt_start + 1),
+									fo, formatter);
+
+								break;
+							}
+
+							if (!self.format_nth(pos, fo, formatter)) {
+								// Failed to print argument (arg index out of bounds), print format specifier instead
+								format_object(self.fmt.sub_string(arg_fmt_start,
+										arg_fmt_end - arg_fmt_start + 1),
+									fo, formatter);
+							}
+						}
+						break;
+				}
+			}
+
+			// Unclosed format specifier, print it as is
+			if (mode != modes::str) {
+				format_object(self.fmt.sub_string(arg_fmt_start,
+						self.fmt.size() - arg_fmt_start),
+					fo, formatter);
+			}
+		}
+	};
+} // namespace detail_
+
+template <typename ...Ts>
+auto fmt(frg::string_view fmt, Ts &&...ts) {
+	return detail_::fmt_impl<Ts...>{fmt, frg::tuple<Ts...>{std::forward<Ts>(ts)...}};
+}
+
+// ----------------------------------------------------------------------------
+// Formatting entry points.
+// ----------------------------------------------------------------------------
+
+// Internally calls format_object() with default options to format an object.
+// format_object() is an ADL customization point of this formatting library.
+template<typename T, typename F>
+void format(const T &object, F &formatter) {
+	format_object(object, format_options{}, formatter);
+}
+
+template<typename T, typename F>
+void format(const T &object, format_options fo, F &formatter) {
+	format_object(object, fo, formatter);
+}
+
+} // namespace frg
+
+#endif // FRG_FORMATTING_HPP

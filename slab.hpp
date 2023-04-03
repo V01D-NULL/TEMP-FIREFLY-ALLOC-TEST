@@ -1,0 +1,269 @@
+#pragma once
+
+#include "frigg/frg/array.hpp"
+#include "frigg/frg/list.hpp"
+#include "frigg/frg/queue.hpp"
+#include "frigg/frg/rbtree.hpp"
+#include "frigg/frg/string.hpp"
+#include <assert.h>
+#include <cstddef>
+#include <cstdint>
+
+using VirtualAddress = uint64_t *;
+
+#define assert_truth(x) assert(x)
+// #include "firefly/intel64/cache.hpp"
+// #include "firefly/logger.hpp"
+// #include "firefly/memory-manager/mm.hpp"
+// #include "firefly/memory-manager/page.hpp"
+// #include "firefly/memory-manager/primary/primary_phys.hpp"
+// #include "libk++/bits.h"
+
+namespace {
+static constexpr bool debugSlab{!false};
+static constexpr bool sanityCheckSlab{!true};
+}; // namespace
+
+struct slabHelper {
+  static constexpr bool powerOfTwo(int n) {
+    return (n > 0) && ((n & (n - 1)) == 0);
+  }
+
+  // Compute the next highest power of 2 of 32-bit 'n'
+  static constexpr int alignToSecondPower(int n) {
+    n--;
+    n |= n >> 1;
+    n |= n >> 2;
+    n |= n >> 4;
+    n |= n >> 8;
+    n |= n >> 16;
+    return ++n;
+  }
+};
+
+/* vm = virtual memory */
+template <class VmBackingAllocator, typename Lock> class slabCache {
+  static constexpr int object_size{
+      8}; // sizeof(slab::object) aka sizeof(frg::intrusive_queue<T>::hook) aka
+          // sizeof(pointer)
+  struct slab;
+  enum SlabType { Small, Large };
+
+  enum SlabState { full, partial, free };
+
+public:
+  slabCache(){};
+  slabCache(int sz, const frg::string_view &descriptor = "anonymous") {
+    initialize(sz, std::move(descriptor));
+  }
+
+  void initialize(int sz, const frg::string_view &descriptor = "anonymous") {
+    // Minimum allocation size has to be the size of a 'struct object',
+    // otherwise the intrusive queue will end up in trouble since it's given too
+    // little memory.
+    if (sz < object_size)
+      sz = object_size;
+
+    size = sz;
+
+    if (!slabHelper::powerOfTwo(size))
+      size = slabHelper::alignToSecondPower(size);
+
+    slab_type = slabTypeOf(sz);
+    this->descriptor = std::move(descriptor);
+    createSlab();
+  }
+
+  VirtualAddress allocate() {
+    lock.lock();
+
+    slab *_slab = slabs[SlabState::partial].first();
+    VirtualAddress object;
+
+    auto do_dequeue = [&]() {
+      return (object = reinterpret_cast<VirtualAddress>(
+                  _slab->object_queue.dequeue()));
+    };
+
+    // Check if we can allocate an object from the partial slab
+    if (!_slab) {
+      _slab = slabs[SlabState::free].first();
+
+      if ((!_slab)) {
+        // panic("TODO: Slab cache is OOM. Implement grow()");
+        grow();
+        _slab = slabs[SlabState::free].first();
+        assert_truth(_slab != nullptr && "Alloc for slab failed");
+      }
+
+      // Move a free slab into the partial slab
+      slabs[SlabState::free].remove(_slab);
+      slabs[SlabState::partial].insert(_slab);
+
+      _slab->slab_state = SlabState::partial;
+      do_dequeue();
+
+      if constexpr (debugSlab)
+        assert_truth(object != nullptr &&
+                     "This should NOT happen, something went really wrong");
+
+      goto end;
+    }
+
+    // Perform the allocation
+    do_dequeue();
+
+    // Check if this slab is full and move it
+    // into the full slab tree if applicable
+    if (!object || _slab->object_queue.size() == 0) {
+      // Fix slab state
+      slabs[SlabState::partial].remove(_slab);
+      slabs[SlabState::full].insert(_slab);
+      _slab->slab_state = SlabState::full;
+
+      // Retry allocation
+      lock.unlock();
+      allocate();
+    }
+
+  end:
+    lock.unlock();
+    return object;
+  }
+
+  void deallocate(VirtualAddress ptr) {
+    lock.lock();
+
+    // Slabs are always aligned on 4kib boundaries.
+    // A 4kib aligned address has it's lowest 12 bits cleared, that's what we're
+    // doing here.
+    constexpr const int shift = 12;
+    slab *_slab = reinterpret_cast<slab *>(
+        (reinterpret_cast<uintptr_t>(ptr) >> shift) << shift);
+
+    if constexpr (sanityCheckSlab) {
+      assert_truth(_slab->object_queue.size() - 1 <
+                       static_cast<size_t>(_slab->max_objects) &&
+                   "Tried to free non-allocated address");
+      assert_truth(_slab->slab_state != SlabState::free &&
+                   "Tried to free non-allocated address");
+    }
+
+    if constexpr (debugSlab) {
+      // logLine << "Slab is located at: " // << fmt::hex
+      //   << reinterpret_cast<uintptr_t>(_slab) << '\n'
+      //   << "Descriptor: " << this->descriptor.data() << ", state: " // <<
+      //   fmt::dec
+      //   << (int)_slab->slab_state << '\n'
+      // << fmt::endl;
+    }
+
+    // This object is most likely still in the cache, so we enqueue it at the
+    // head. This will make sure we hand out "cache warm" objects whenever
+    // possible.
+    _slab->object_queue.enqueue_head(reinterpret_cast<slab::object *>(ptr));
+
+    // If this object was full, move it the the partial slab
+    if (_slab->slab_state == SlabState::full) {
+      auto previous_state = _slab->slab_state;
+      _slab->slab_state = SlabState::partial;
+
+      slabs[previous_state].remove(_slab);
+      slabs[SlabState::partial].insert(_slab);
+    }
+
+    lock.unlock();
+  }
+
+private:
+  void grow() { createSlab(); }
+
+  void shrink();
+
+  void createSlab() {
+    size_t alloc_sz = slab_type == SlabType::Large ? 0x00200000 : 4096;
+
+    if constexpr (debugSlab) {
+      // logLine << "Start of slab creation\n";
+      // logLine << "slab descriptor='" << descriptor.data() << "'\n";
+      // logLine << "Creating new slab with an allocation of size '" << alloc_sz
+      //   << "', object size is: " << size << '\n';
+      // logLine << "is large slab: "
+      //   << (alloc_sz == 0x00200000 ? "true" : "false") << '\n' // <<
+      //   fmt::endl;
+    }
+
+    auto base = reinterpret_cast<uintptr_t>(vm_backing.allocate(alloc_sz));
+    slab *_slab = new (reinterpret_cast<void *>(base)) struct slab(
+        descriptor, base, alloc_sz, size);
+    slabs[SlabState::free].insert(_slab);
+
+    // if constexpr (debugSlab)
+    // logLine << "slab can hold " << _slab->max_objects
+    //   << " objects\nEnd of slab creation\n" // << fmt::endl;
+  }
+
+  SlabType slabTypeOf(int size) const {
+    return size > static_cast<int>(4096 / 8) ? SlabType::Large
+                                             : SlabType::Small;
+  }
+
+  frg::string_view descriptor;
+
+private:
+  struct slab {
+    struct object : frg::default_queue_hook<object> {};
+
+    slab(const frg::string_view &_descriptor, uintptr_t address, size_t len,
+         size_t sz)
+        : descriptor{_descriptor} {
+      // Note:
+      // Technically this is breaking the spec which mandates the slab be placed
+      // at the _end_, but I prefer it this way and don't see any major issues
+      // as a result of doing it like this. - V01D
+      //
+      // Reserve some memory for the slab structure & align it to sizeof(slab)
+      // bytes. If we don't do this we will end up overwriting the object we
+      // just created.
+      // logLine << "base addr of slab=" // << fmt::hex << address << '\n'
+      // << fmt::endl;
+      address += sizeof(slab);
+      address = (address + sizeof(slab) - 1) & ~(sizeof(slab) - 1);
+      base_address = address;
+
+      for (auto i = address; i <= (address + len); i += sz) {
+
+        frg::queue_result res =
+            object_queue.enqueue(reinterpret_cast<object *>(i));
+        assert(res == frg::queue_result::Okay);
+      }
+
+      slab_state = SlabState::free;
+      max_objects = object_queue.size() - 1;
+      // logLine << "SIZE: " << sizeof(object) << '\n' // << fmt::endl;
+    }
+
+    frg::string_view descriptor;
+    uintptr_t base_address;
+    size_t max_objects;
+
+    SlabState slab_state;
+    frg::intrusive_queue<object> object_queue;
+    frg::rbtree_hook tree_hook;
+  };
+
+  struct comparator {
+    bool operator()(const slab &a, const slab &b) {
+      return a.base_address < b.base_address;
+    }
+  };
+
+  int size;
+  Lock lock;
+  SlabType slab_type;
+  VmBackingAllocator vm_backing;
+
+  // Full, partial and free slabs
+  alignas(64)
+      frg::array<frg::rbtree<slab, &slab::tree_hook, comparator>, 3> slabs = {};
+};
